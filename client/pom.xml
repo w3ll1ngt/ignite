@@ -1,0 +1,12 @@
+<dependencies>
+    <dependency>
+        <groupId>org.apache.ignite</groupId>
+        <artifactId>ignite-core</artifactId>
+        <version>2.15.0</version> <!-- Укажи свою версию -->
+    </dependency>
+    <dependency>
+        <groupId>org.apache.ignite</groupId>
+        <artifactId>ignite-client</artifactId>
+        <version>2.15.0</version>
+    </dependency>
+</dependencies>
