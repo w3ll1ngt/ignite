@@ -15,17 +15,13 @@
  * limitations under the License.
  */
 
-package org.apache.ignite.development.utils;
+package org.apache.ignite.internal.commandline.walreader;
 
 import java.util.Arrays;
 import org.apache.ignite.internal.pagemem.wal.record.MetastoreDataRecord;
 
 import static java.lang.String.valueOf;
 import static java.nio.charset.StandardCharsets.UTF_8;
-import static org.apache.ignite.development.utils.ProcessSensitiveData.HASH;
-import static org.apache.ignite.development.utils.ProcessSensitiveData.HIDE;
-import static org.apache.ignite.development.utils.ProcessSensitiveData.MD5;
-import static org.apache.ignite.development.utils.ProcessSensitiveDataUtils.md5;
 
 /**
  * Wrapper {@link MetastoreDataRecord} for sensitive data output.
@@ -39,12 +35,12 @@ class MetastoreDataRecordWrapper extends MetastoreDataRecord {
      */
     public MetastoreDataRecordWrapper(MetastoreDataRecord metastoreRecord, ProcessSensitiveData sensitiveData) {
         super(
-            HIDE == sensitiveData ? "" :
-                HASH == sensitiveData ? valueOf(metastoreRecord.key().hashCode()) :
-                    MD5 == sensitiveData ? md5(metastoreRecord.key()) : metastoreRecord.key(),
-            HIDE == sensitiveData ? new byte[0] :
-                HASH == sensitiveData ? valueOf(Arrays.hashCode(metastoreRecord.value())).getBytes(UTF_8) :
-                    MD5 == sensitiveData ? md5(Arrays.toString(metastoreRecord.value())).getBytes(UTF_8) :
+            ProcessSensitiveData.HIDE == sensitiveData ? "" :
+                ProcessSensitiveData.HASH == sensitiveData ? valueOf(metastoreRecord.key().hashCode()) :
+                    ProcessSensitiveData.MD5 == sensitiveData ? ProcessSensitiveDataUtils.md5(metastoreRecord.key()) : metastoreRecord.key(),
+            ProcessSensitiveData.HIDE == sensitiveData ? new byte[0] :
+                ProcessSensitiveData.HASH == sensitiveData ? valueOf(Arrays.hashCode(metastoreRecord.value())).getBytes(UTF_8) :
+                    ProcessSensitiveData.MD5 == sensitiveData ? ProcessSensitiveDataUtils.md5(Arrays.toString(metastoreRecord.value())).getBytes(UTF_8) :
                         metastoreRecord.value()
         );
 

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-package org.apache.ignite.development.utils;
+package org.apache.ignite.internal.commandline.walreader;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -25,6 +25,11 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import javax.cache.expiry.CreatedExpiryPolicy;
+import javax.cache.expiry.Duration;
+import javax.cache.expiry.EternalExpiryPolicy;
+import javax.cache.expiry.ExpiryPolicy;
 import org.apache.ignite.IgniteCache;
 import org.apache.ignite.IgniteSystemProperties;
 import org.apache.ignite.cache.CacheAtomicityMode;
@@ -42,17 +47,20 @@ import org.apache.ignite.internal.pagemem.wal.record.WALRecord;
 import org.apache.ignite.internal.processors.cache.persistence.filename.NodeFileTree;
 import org.apache.ignite.internal.processors.cache.persistence.wal.WALPointer;
 import org.apache.ignite.internal.processors.cache.persistence.wal.serializer.RecordV1Serializer;
+import org.apache.ignite.internal.processors.platform.cache.expiry.PlatformExpiryPolicyFactory;
 import org.apache.ignite.internal.util.lang.IgniteThrowableConsumer;
 import org.apache.ignite.internal.util.typedef.T2;
 import org.apache.ignite.internal.util.typedef.internal.U;
+import org.apache.ignite.spi.systemview.view.CacheView;
 import org.apache.ignite.testframework.junits.common.GridCommonAbstractTest;
 import org.jetbrains.annotations.Nullable;
 import org.junit.Test;
 
 import static java.util.Collections.emptyList;
 import static org.apache.ignite.configuration.DataStorageConfiguration.DFLT_WAL_PATH;
-import static org.apache.ignite.development.utils.IgniteWalConverter.convert;
-import static org.apache.ignite.development.utils.IgniteWalConverterArguments.parse;
+
+import static org.apache.ignite.internal.commandline.walreader.IgniteWalConverter.convert;
+import static org.apache.ignite.internal.commandline.walreader.IgniteWalConverterArguments.parse;
 import static org.apache.ignite.testframework.GridTestUtils.assertContains;
 
 /**
@@ -141,6 +149,59 @@ public class IgniteWalConverterTest extends GridCommonAbstractTest {
     }
 
     /**
+     * Test for {@link CacheView} expiry policy factory representation. The test initializes the {@link CacheConfiguration}
+     * with custom {@link PlatformExpiryPolicyFactory}. Given different ttl input, the test checks the {@link String}
+     * expiry policy factory outcome for {@link CacheView#expiryPolicyFactory()}.
+     */
+    @Test
+    public void testCacheViewExpiryPolicy() throws Exception {
+        try (IgniteEx g = startGrid()) {
+            g.cluster().state(ClusterState.ACTIVE);
+
+            CacheConfiguration<Integer, Integer> ccfg = new CacheConfiguration<>();
+            ccfg.setName("cache");
+            ccfg.setExpiryPolicyFactory(EternalExpiryPolicy.factoryOf());
+
+            IgniteCache<Integer, Integer> cache = g.getOrCreateCache(ccfg);
+
+            log.info("Created static.");
+
+            cache.put(2, 2);
+
+            log.info("Put for static.");
+
+            cache.withExpiryPolicy(getPolicy()).put(1, 1);
+
+            log.info("Put for non-static.");
+
+            NodeFileTree ft = g.context().pdsFolderResolver().fileTree();
+
+            final IgniteWalConverterArguments arg = new IgniteWalConverterArguments(
+                    ft,
+                    DataStorageConfiguration.DFLT_PAGE_SIZE,
+                    false,
+                    null,
+                    null, null, null, null, true, true, emptyList()
+            );
+
+            final ByteArrayOutputStream outByte = new ByteArrayOutputStream();
+
+            final PrintStream out = new PrintStream(outByte);
+
+            convert(out, arg);
+
+            final String result = outByte.toString();
+
+            System.out.println(result);
+        }
+    }
+
+    /** */
+    private ExpiryPolicy getPolicy() {
+        return new CreatedExpiryPolicy(new Duration(TimeUnit.SECONDS, 200L));
+    }
+
+    /**
      * Checking utility IgniteWalConverter
      * <ul>
      *     <li>Start node</li>
@@ -202,7 +263,7 @@ public class IgniteWalConverterTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Checking utility IgniteWalConverter with out binary_meta
+     * Checking utility IgniteWalConverter without binary_meta
      * <ul>
      *     <li>Start node</li>
      *     <li>Create cache with
@@ -303,7 +364,7 @@ public class IgniteWalConverterTest extends GridCommonAbstractTest {
                 if (recordTypeIdx > 0) {
                     recordTypeIdx--;
 
-                    final long idx = raf.readLong();
+                    raf.readLong();
 
                     final int fileOff = Integer.reverseBytes(raf.readInt());
 
@@ -425,7 +486,7 @@ public class IgniteWalConverterTest extends GridCommonAbstractTest {
                         }
                     }
 
-                    final long idx = raf.readLong();
+                    raf.readLong();
 
                     final int fileOff = Integer.reverseBytes(raf.readInt());
 
@@ -491,7 +552,7 @@ public class IgniteWalConverterTest extends GridCommonAbstractTest {
     }
 
     /**
-     * Check that when using the "pages" argument we will see WalRecord with this pages in the utility output.
+     * Check that when using the "pages" argument we will see WalRecord with these pages in the utility output.
      *
      * @throws Exception If failed.
      */
