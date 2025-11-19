@@ -32,6 +32,7 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
@@ -241,6 +242,87 @@ public class TcpDiscoveryNetworkIssuesTest extends GridCommonAbstractTest {
     }
 
     /**
+     * Test scenario:
+     *
+     * Expected outcome: .
+     *
+     * @throws Exception
+     */
+    @Test
+    public void testHopsConnectionRecovery() throws Exception {
+        usePortFromNodeName = true;
+
+        connectionRecoveryTimeout = 3_000;
+        failureDetectionTimeout = 4_000;
+
+        AtomicBoolean netBroken = new AtomicBoolean(false);
+        AtomicInteger hops = new AtomicInteger(0);
+
+        specialSpi = new TcpDiscoverySpi() {
+            private boolean isTargetPort(int port) {
+                return port == NODE_1_PORT
+                        || port == NODE_2_PORT
+                        || port == NODE_3_PORT
+                        || port == NODE_4_PORT;
+            }
+
+            @Override protected int readReceipt(Socket sock, long timeout) throws IOException {
+                if (netBroken.get() && isTargetPort(sock.getPort())) {
+                    hops.incrementAndGet();
+
+                    throw new SocketTimeoutException(
+                            "Read timed out by port: " + sock.getPort() +
+                                    " addr: " + sock.getInetAddress());
+                }
+
+                return super.readReceipt(sock, timeout);
+            }
+
+            @Override protected Socket openSocket(InetSocketAddress sockAddr, IgniteSpiOperationTimeoutHelper timeoutHelper)
+                    throws IOException, IgniteSpiOperationTimeoutException {
+                if (netBroken.get() && isTargetPort(sockAddr.getPort())) {
+                    hops.incrementAndGet();
+
+                    throw new SocketTimeoutException(
+                            "connect timed out by port: " + sockAddr.getPort() +
+                                    " addr: " + sockAddr);
+                }
+
+                return super.openSocket(sockAddr, timeoutHelper);
+            }
+
+        };
+
+        IgniteEx ig0 = startGrid(NODE_0_NAME);
+
+        specialSpi = null;
+
+        startGrid(NODE_1_NAME);
+        startGrid(NODE_2_NAME);
+        startGrid(NODE_3_NAME);
+        startGrid(NODE_4_NAME);
+
+        AtomicBoolean illNodeSegmented = new AtomicBoolean(false);
+        ig0.events().localListen(e -> {
+            illNodeSegmented.set(true);
+
+            return false;
+        }, EVT_NODE_SEGMENTED);
+
+        breakDiscoConnectionToNext(ig0);
+        netBroken.set(true);
+
+        assertTrue("node 00 should be segmentted here", waitForCondition(illNodeSegmented::get, 10_000));
+
+        assertEquals(3, hops.get());
+
+        Map<?, ?> failedNodes = getFailedNodesCollection(ig0);
+
+        assertTrue(String.format("Failed nodes is expected to be empty, but contains %s nodes.", failedNodes.size()),
+                failedNodes.isEmpty());
+    }
+
+    /**
      * Tests backward ping of previous node if {@link TcpDiscoveryNode#socketAddresses()} contains same loopback address
      * as of local node. Assumes single localhost is set and single local address is resolved.
      */
@@ -412,6 +494,209 @@ public class TcpDiscoveryNetworkIssuesTest extends GridCommonAbstractTest {
         for (Ignite ig : G.allGrids())
             assertEquals(3, ig.cluster().nodes().size());
     }
+
+    @Test
+    public void testMultipleFailNodes() throws Exception {
+        connectionRecoveryTimeout = 1_000;
+        failureDetectionTimeout = 1_000;
+        usePortFromNodeName = true;
+
+        int gridCnt = 8;
+
+        startGrids(gridCnt);
+
+        awaitPartitionMapExchange();
+
+        Set<Integer> failedNodes = Set.of(4,5,6,7);
+
+        CountDownLatch failLatch = new CountDownLatch(failedNodes.size());
+
+        for (int i = 0; i < gridCnt; i++) {
+            IgniteEx ig = ignite(i);
+
+            // Слушаем фейлы только на node0, чтобы считать по "упавшим" нодам.
+            if (i == 0) {
+                ig.events().localListen(evt -> {
+                    failLatch.countDown();
+                    return true;
+                }, EVT_NODE_FAILED);
+            }
+
+            int nodeIdx = i;
+
+            ig.events().localListen(evt -> {
+                segmentedNodes.add(nodeIdx);
+                return true;
+            }, EVT_NODE_SEGMENTED);
+        }
+
+        failedNodes.forEach(idx -> processNetworkThreads(ignite(idx), Thread::suspend));
+
+        try {
+            assertTrue("Failed nodes were not detected in time",
+                    failLatch.await(10, TimeUnit.SECONDS));
+        }
+        finally {
+            failedNodes.forEach(idx -> processNetworkThreads(ignite(idx), Thread::resume));
+        }
+
+        log.info("segmentations check");
+
+        segmentedNodes.iterator().forEachRemaining(node -> log.info("check the node " + node.toString()));
+//        assertTrue("Node 0 must be segmented", segmentedNodes.contains(0));
+
+        for (int i = 0; i < gridCnt; i++) {
+            if (!failedNodes.contains(i))
+                assertFalse("test should be here " + i ,segmentedNodes.contains(i));
+        }
+    }
+
+    @Test
+    public void testThreeHops() throws Exception {
+        // Создаем набор для отслеживания сегментированных узлов (номера узлов, у которых произошло событие сегментации)
+        Set<Integer> segmentedNodes = Collections.synchronizedSet(new HashSet<>());
+        // Защелка для ожидания события сегментации (CountDownLatch с начальним значением 1, т.к. ждем хотя бы одно событие)
+
+        connectionRecoveryTimeout = 1_000;
+        failureDetectionTimeout = 1_000;
+//        usePortFromNodeName = true;
+
+        int gridCnt = 8;
+        IgniteEx ign =  startGrids(gridCnt);
+
+        awaitPartitionMapExchange();
+
+        CountDownLatch segmentationLatch = new CountDownLatch(1);  // например, 1 или 5
+
+        for (int i = 0; i < gridCnt; i++) {
+            final int idx = i;
+
+            ignite(i).events().localListen(evt -> {
+                if (evt.type() == EVT_NODE_SEGMENTED) {
+                    segmentedNodes.add(idx);
+                    segmentationLatch.countDown();
+                }
+                return true;
+            }, EVT_NODE_SEGMENTED);
+        }
+
+        // Убеждаемся, что кластер сформирован из всех 8 узлов (проверяем на первом узле, что видны все узлы)
+//        Ignite ignite0 = igniteNodes[0];
+//        for (int attempt = 0; attempt < 50; attempt++) {
+//            if (ignite0.cluster().nodes().size() == gridCnt)
+//                break;
+//            Thread.sleep(100);
+//        }
+        assert ign.cluster().nodes().size() == gridCnt : "Cluster formation failed (not all nodes joined)";
+
+        // Эмулируем потерю связи узла 3 с узлами 4,5,6,7: "отключаем" эти узлы.
+        // Для имитации сетевого обрыва приостанавливаем потоки Discovery SPI на узлах 4,5,6,7.
+//        processNetworkThreads(
+//                java.util.Arrays.asList(igniteNodes[4], igniteNodes[5], igniteNodes[6], igniteNodes[7]),
+//                Thread::suspend  // приостанавливаем выполнение (замораживаем) сетевые потоки discovery на выбранных узлах
+//        );
+//
+        Arrays.asList(4,5,6,7).forEach(idx -> processNetworkThreads(ignite(idx), Thread::suspend));
+
+
+        // После этого узел 3 потерял соединение со своим соседом (узлом 4) и следующими по кольцу узлами (5,6,7).
+        // В TcpDiscoverySpi предусмотрен механизм "прыжков" (hops) для восстановления кольца:
+        // connCheckTick = connectionRecoveryTimeout / 3, то есть 1000мс/3 ≈ 333мс.
+        // Узел 3 будет пытаться подключиться к узлу 4 (соседу) и ждать один "тик" (~333 мс).
+        // Если не удалось — перейдет к следующему (узлу 5) на следующий тик, затем к узлу 6.
+        // Всего 3 попытки (три прыжка по кольцу). Если ни один узел не откликнулся, узел 3 решает, что он сегментирован (отсоединен от кластера).
+        // Ожидаем, что в нашей ситуации именно так и произойдет.
+
+        // Ждем событие EVT_NODE_SEGMENTED от узла 3.
+        // Используем CountDownLatch, чтобы ограничить время ожидания и не зависнуть, если событие не произойдет.
+        boolean segmented = segmentationLatch.await(5, TimeUnit.SECONDS);
+        // Проверяем, что событие сегментации действительно произошло
+        assert segmented : "Segmentation event did not occur as expected";
+        // Проверяем, что сегментировался узел с индексом 3 и только он
+        assert segmentedNodes.contains(3) : "Node 3 was expected to segment, but segmentedNodes=" + segmentedNodes;
+        assert segmentedNodes.size() == 1 : "Unexpected other nodes segmented: " + segmentedNodes;
+
+        // Возобновляем работу приостановленных узлов (восстанавливаем их сетевые потоки)
+//        processNetworkThreads(
+//                java.util.Arrays.asList(igniteNodes[4], igniteNodes[5], igniteNodes[6], igniteNodes[7]),
+//                Thread::resume  // продолжаем выполнение ранее приостановленных потоков
+//        );
+
+        Arrays.asList(4,5,6,7).forEach(idx -> processNetworkThreads(ignite(idx), Thread::resume));
+
+//        // Останавливаем все узлы Ignite, чтобы корректно завершить тест и освободить ресурсы
+//        Ignition.stopAll(true);
+    }
+
+//    @Test
+//    public void testCountOpenSocketRealHops() throws Exception {
+//        // Тот же кластер из 8 узлов и те же настройки таймаутов.
+//        // В этом тесте переопределяем поведение узла 3, чтобы подсчитать количество попыток подключений (openSocket).
+//        CountingDiscoverySpi countingSpi = new CountingDiscoverySpi();  // SPI с переопределенным openSocket для подсчета вызовов
+//
+//        final int NODE_COUNT = 8;
+//        TcpDiscoveryVmIpFinder ipFinder = new TcpDiscoveryVmIpFinder();
+//        ipFinder.setAddresses(Collections.singletonList("127.0.0.1:47500..47507"));
+//
+//        Ignite[] igniteNodes = new Ignite[NODE_COUNT];
+//        for (int i = 0; i < NODE_COUNT; i++) {
+//            IgniteConfiguration cfg = new IgniteConfiguration();
+//            cfg.setIgniteInstanceName("node" + i);
+//
+//            // Для узла 3 используем наш CountingDiscoverySpi, для остальных — обычный TcpDiscoverySpi
+//            TcpDiscoverySpi discoSpi = (i == 3 ? countingSpi : new TcpDiscoverySpi());
+//            discoSpi.setIpFinder(ipFinder);
+//            discoSpi.setLocalPort(47500 + i);
+//            discoSpi.setConnectionRecoveryTimeout(1000);
+//            cfg.setDiscoverySpi(discoSpi);
+//
+//            cfg.setFailureDetectionTimeout(1000);
+//            cfg.setIncludeEventTypes(EventType.EVT_NODE_SEGMENTED);
+//
+//            Ignite ignite = Ignition.start(cfg);
+//            igniteNodes[i] = ignite;
+//        }
+//
+//        // Дожидаемся, когда все 8 узлов объединились в кластер (проверяем по первому узлу)
+//        Ignite ignite0 = igniteNodes[0];
+//        for (int attempt = 0; attempt < 50; attempt++) {
+//            if (ignite0.cluster().nodes().size() == NODE_COUNT)
+//                break;
+//            Thread.sleep(100);
+//        }
+//        assert ignite0.cluster().nodes().size() == NODE_COUNT : "Cluster formation failed";
+//
+//        // Обнуляем счетчик openSocket перед инцидентом, чтобы не учитывать подключения при старте кластера
+//        countingSpi.openSocketCount.set(0);
+//
+//        // "Отключаем" узлы 4-7 так же, как и в первом тесте, имитируя одновременный сбой нескольких узлов
+//        processNetworkThreads(
+//                java.util.Arrays.asList(igniteNodes[4], igniteNodes[5], igniteNodes[6], igniteNodes[7]),
+//                Thread::suspend
+//        );
+//
+//        // Узел 3 начнет попытки переподключения (hops) к узлам 4, 5, 6 по очереди.
+//        // Каждая такая попытка вызовет метод openSocket в нашем CountingDiscoverySpi.
+//        // Ожидаем ровно 3 вызова openSocket (по одному на каждый узел, т.к. connCheckTick разбивает 1000мс на три попытки).
+//        Thread.sleep(2000);  // ждем чуть больше 1 секунды, чтобы все попытки завершились
+//
+//        // Проверяем, сколько раз вызывался openSocket на узле 3
+//        int openSockCalls = countingSpi.openSocketCount.get();
+//        assert openSockCalls == 3 : "openSocket was called " + openSockCalls + " times, expected 3";
+//
+//        // (Примечание: аналогично тесту выше можно установить слушатель события EVT_NODE_SEGMENTED,
+//        // чтобы убедиться, что узел 3 действительно сегментировался после 3 неудачных попыток.)
+//
+//        // Возобновляем работу узлов 4-7, восстанавливая их сетевые потоки
+//        processNetworkThreads(
+//                java.util.Arrays.asList(igniteNodes[4], igniteNodes[5], igniteNodes[6], igniteNodes[7]),
+//                Thread::resume
+//        );
+//
+//        // Останавливаем все узлы Ignite
+//        Ignition.stopAll(true);
+//    }
+
 
     /**
      * Ensures sequential failure of two nodes has no additional issues.
