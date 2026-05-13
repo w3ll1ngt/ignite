@@ -12,7 +12,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-= Generic Performance Tips
+= General Performance Tips
 
 Ignite as distributed storages and platforms require certain optimization techniques. Before you dive
 into the more advanced techniques described in this and other articles, consider the following basic checklist:
@@ -47,3 +47,20 @@ queries with JOINs at massive scale and expect significant performance benefits.
 
 * Adjust link:data-rebalancing[data rebalancing settings] to ensure that rebalancing completes faster when your cluster topology changes.
 
+== What healthy cluster behavior looks like
+
+A healthy Ignite cluster is not defined by a single latency, CPU, or memory number. In practice, it is a cluster whose topology is stable, whose cluster state and baseline match the intended deployment, whose partitions are not lost or divergent, whose rebalancing and checkpointing complete in bounded time, and whose execution queues and memory pools return to a steady level after short-lived spikes. Ignite exposes these signals through built-in metrics, system views, and the control script rather than through a single aggregate health score.
+
+When checking whether a cluster is healthy, start with topology and cluster state. The cluster should be in the expected state, usually ACTIVE, and the number of server and client nodes should be stable. If native persistence is enabled, the baseline should also be in the expected shape: for a stable deployment, the nodes that are expected to be online should appear online both in baseline-related metrics and in the SYS.BASELINE_NODES system view. Frequent unexpected topology changes are not normal and should be treated as a sign of node instability or network problems.
+
+Then check data safety and convergence. A healthy cluster does not have lost partitions, and consistency checks such as control.sh --cache idle_verify should not report conflict partitions when the cluster is idle. After a topology event, transient rebalancing is expected, but it should converge: KeysToRebalanceLeft should trend to zero, and partition states should settle back to OWNING rather than remain in MOVING, RENTING, or LOST.
+
+Next, check execution pressure. Communication, discovery, and thread-pool queues may spike under load, but they should not grow continuously. In Ignite, sustained growth of OutboundMessagesQueueSize, MessageWorkerQueueSize, or thread pool queue sizes means that the node is not keeping up with the workload or that message processing is impaired. The same logic applies to the striped executor: temporary backlog can happen, but a persistent backlog or repeating starvation warnings are signs of contention, hot partitions, or blocked internal processing. Use SYS.STRIPED_THREADPOOL_QUEUE, SYS.TRANSACTIONS, and SYS.SQL_QUERIES for a live view of the work that is not draining.
+
+Checkpointing and transactions should also remain bounded. Checkpoint activity can slow the cluster down, so LastCheckpointDuration should be monitored together with dirty pages and disk behavior. Transactions and queries can legitimately take longer during bursts, but healthy steady-state behavior means that lock-holding transactions, long-running transactions, and long-running SQL queries do not accumulate over time. If long transactions repeatedly block partition map exchange, use transaction timeout settings such as TxTimeoutOnPartitionMapExchange and investigate the application path that keeps transactions open.
+
+Finally, check the underlying JVM and critical workers. Ignite treats IgniteOutOfMemoryException, OutOfMemoryError, system worker termination, system worker hangs, and cluster node segmentation as critical failures. A healthy cluster should not emit blocked system-critical worker messages, and JVM resource pools should stay comfortably below exhaustion. In practice, monitor heap usage, direct buffer usage, and open file descriptors continuously, because all three are finite pools and approaching their limits usually means the node is already close to a failure condition rather than merely under benign load.
+
+If CDC is enabled, include it in the health model explicitly. A healthy CDC pipeline is not just a running process: it is a process whose WAL segment consumption advances, whose ignite-cdc.log does not contain repeated warnings or errors, and whose segment sequence has no gaps. Missed segments indicate lost changes and should be treated as a data-delivery problem, not as a minor logging issue.
+
+As a practical rule, if topology is stable, baseline is correct, partitions are consistent, queues drain, checkpointing and rebalancing converge, long-lived transactions and queries do not accumulate, and JVM and OS resource pools remain below saturation, the cluster is usually in a normal operational state. Temporary spikes are acceptable during rebalancing, index rebuild, snapshots, bulk loading, or analytical queries, but healthy systems converge back to their baseline after the event ends.
